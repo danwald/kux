@@ -1,0 +1,46 @@
+#!/bin/bash
+# kux — per-shell Kubernetes context and namespace isolation. See docs/DESIGN.md.
+# AIDEV-NOTE: must stay bash-3.2 compatible (macOS /bin/bash): no assoc arrays, no ${x,,}, no mapfile.
+
+set -u
+
+KUX_VERSION="0.1.0"
+
+usage() {
+	cat <<'EOF'
+kux — per-shell kubectl context and namespace
+
+Usage:
+  kux                        show this shell's context and namespace
+  kux ctx [name|-]           list/pick, switch to, or toggle back a context
+  kux ns [name|-]            list/pick, set, or toggle back a namespace
+  kux unset                  return to the unpinned state a new shell starts in
+  kux refresh                regenerate this shell's cluster file
+  kux promote                move clusters/users written into the overlay to the real config
+  kux status [--json]        show state
+  kux init zsh|bash [--no-prompt]
+                             print shell integration; add to your rc file:
+                               eval "$(kux init zsh)"
+  kux --version
+EOF
+}
+
+die() {
+	printf 'kux: %s\n' "$*" >&2
+	exit 1
+}
+
+main() {
+	local cmd="${1:-status}"
+	[ $# -gt 0 ] && shift
+	case "$cmd" in
+		-h | --help | help) usage ;;
+		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
+		*)
+			usage >&2
+			die "unknown command: $cmd"
+			;;
+	esac
+}
+
+main "$@"

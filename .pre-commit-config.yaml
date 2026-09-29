@@ -1,0 +1,19 @@
+repos:
+  - repo: local
+    hooks:
+      - id: shfmt
+        name: shfmt
+        entry: shfmt -d
+        language: system
+        files: ^(bin/kux|test/.*\.(bash|bats))$
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        files: ^(bin/kux|test/.*\.bash)$
+      - id: bats
+        name: bats
+        entry: bats test
+        language: system
+        pass_filenames: false
+        files: ^(bin/kux|test/)
