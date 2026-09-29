@@ -18,7 +18,6 @@ Usage:
   kux refresh                regenerate this shell's cluster file
   kux promote                move clusters/users written into the overlay to the real config
   kux status [--json]        show state
-  kux gc                     remove state left by shells that are gone
   kux init zsh|bash [--no-prompt]
                              print shell integration; add to your rc file:
                                eval "$(kux init zsh)"

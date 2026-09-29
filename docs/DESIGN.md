@@ -85,6 +85,9 @@ state is recomputed from it, so re-running init is idempotent.
 | `kux --version` | Version |
 | `kux gc` (hidden) | Sweep dead shells' state |
 
+`status --json` prints one object: `shell` (bool) and `context`; inside a shell also `id`,
+`alias`, `namespace`, `pinned`, `cluster_file`, `kubeconfig`, and `markers` (e.g. `["!stale"]`).
+
 Name resolution: exact real name → exact alias → unique substring of an alias → error listing the
 candidates. Ambiguity is never resolved silently.
 
