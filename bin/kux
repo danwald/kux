@@ -30,12 +30,85 @@ die() {
 	exit 1
 }
 
+# The user's real kubeconfig list — never the per-shell one.
+orig_kubeconfig() {
+	printf '%s' "${KUX_ORIG_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+}
+
+# kubectl against the real kubeconfig.
+kc_orig() {
+	KUBECONFIG="$(orig_kubeconfig)" kubectl "$@"
+}
+
+# alias<TAB>real-name for every context in the real kubeconfig (DESIGN §5).
+# AIDEV-NOTE: collisions are resolved over the whole list; aliases double as projection filenames.
+alias_table() {
+	kc_orig config get-contexts -o name 2>/dev/null | awk '
+		function san(s) { gsub(/[\/:]/, "_", s); return s }
+		NF {
+			n[++c] = $0; base = ""; dis = ""
+			if ($0 ~ /^arn:aws:eks:[^:]*:[0-9]+:cluster\/./) {
+				split($0, p, ":"); dis = p[5]
+				base = substr($0, index($0, ":cluster/") + 9)
+			} else if ($0 ~ /^gke_[^_]+_[^_]+_[^_]+$/) {
+				split($0, p, "_"); base = p[4]; dis = p[2]
+			}
+			base = (base == "") ? san($0) : san(base)
+			b[c] = base; d[c] = dis; cnt1[base]++
+		}
+		END {
+			for (i = 1; i <= c; i++) {
+				a[i] = b[i]
+				if (cnt1[b[i]] > 1) a[i] = (d[i] != "") ? b[i] "@" d[i] : san(n[i])
+				cnt2[a[i]]++
+			}
+			for (i = 1; i <= c; i++) {
+				if (cnt2[a[i]] > 1) a[i] = san(n[i])
+				print a[i] "\t" n[i]
+			}
+		}'
+}
+
+# Resolve user input to "alias<TAB>real" (DESIGN §4): exact real name, exact alias, then a unique
+# alias substring. Ambiguity is an error — never guess on a machine with prod in it.
+resolve_context() {
+	local want="$1" table hit
+	table="$(alias_table)"
+	[ -n "$table" ] || die "no contexts found in $(orig_kubeconfig)"
+	hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" '$2 == w' | head -1)"
+	[ -n "$hit" ] || hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" '$1 == w' | head -1)"
+	if [ -z "$hit" ]; then
+		hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" 'index($1, w)')"
+		case "$hit" in
+			"") die "no context matches '$want' (see: kux ctx)" ;;
+			*"
+"*)
+				printf 'kux: %s is ambiguous:\n' "'$want'" >&2
+				printf '%s\n' "$hit" | awk -F'\t' '{ printf "  %-24s %s\n", $1, $2 }' >&2
+				exit 1
+				;;
+		esac
+	fi
+	printf '%s\n' "$hit"
+}
+
+cmd_ctx() {
+	if [ $# -eq 0 ]; then
+		alias_table | cut -f1
+		return
+	fi
+	die "switching contexts is not implemented yet"
+}
+
 main() {
 	local cmd="${1:-status}"
 	[ $# -gt 0 ] && shift
 	case "$cmd" in
 		-h | --help | help) usage ;;
 		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
+		ctx) cmd_ctx "$@" ;;
+		_aliases) alias_table ;;
+		_resolve) resolve_context "$1" ;;
 		*)
 			usage >&2
 			die "unknown command: $cmd"
