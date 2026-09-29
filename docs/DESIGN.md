@@ -101,7 +101,8 @@ Collisions are computed over the whole list every time. If a disambiguated alias
 
 ## 6. Prompt
 
-zsh prepends to `RPROMPT`, bash prepends to `PS1`, both idempotent; `--no-prompt` skips that and
+zsh prepends to `RPROMPT`, bash prepends `[…] ` to `PS1`, both idempotent (a prompt changed by
+another tool becomes the new base); `--no-prompt` skips that and
 leaves `$_KUX_PROMPT` for manual placement. Steady state costs **no process**: the hook reads
 `prompt` with the `read` builtin and runs only `test`-style checks.
 
@@ -115,6 +116,9 @@ Text: `☸ <alias>:<namespace>` (namespace `default` when unset), followed by ma
 | `!edited` | `KUBECONFIG` was changed by hand; kux leaves it alone | `kux ctx …` / `kux unset` |
 
 The hook forks `kux _prompt` only when the overlay is newer than `prompt` (an external write).
+That refresh also repairs a `current-context` left without a stanza by an external `use-context`.
+While `!promote` is showing, kux refuses to rewrite the overlay so nothing is lost.
+`\ $ ` %` in names are replaced with `_` in the prompt text so it is inert in both shells.
 
 ## 7. Lifetime
 
