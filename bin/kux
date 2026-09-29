@@ -18,6 +18,7 @@ Usage:
   kux refresh                regenerate this shell's cluster file
   kux promote                move clusters/users written into the overlay to the real config
   kux status [--json]        show state
+  kux gc                     remove state left by shells that are gone
   kux init zsh|bash [--no-prompt]
                              print shell integration; add to your rc file:
                                eval "$(kux init zsh)"
@@ -275,12 +276,73 @@ cmd_start() {
 	write_prompt
 	mv "$tmpdir" "$dir"
 	KUX_STATE="$dir"
+	gc_sweep "$id" >/dev/null 2>&1
 	printf 'export KUX_ID=%s KUX_PID=%s KUX_STATE=%s KUX_ORIG_KUBECONFIG=%s\n' \
 		"$(shq "$id")" "$(shq "$pid")" "$(shq "$dir")" "$(shq "$orig")"
 	# shellcheck disable=SC2016 # expanded by the shell that evals this
 	printf 'export KUBECONFIG=%s; _KUX_KUBECONFIG="$KUBECONFIG"\n' \
 		"$(shq "$dir/overlay.yaml:$orig")"
 	printf 'unset KUX_CLUSTER_FILE\n'
+}
+
+# "pid<TAB>lstart" per live pid of comma list $1.
+# AIDEV-NOTE: BSD ps prints nothing if ANY pid is out of range — then retry one pid at a time.
+live_procs() {
+	local out p
+	out="$(LC_ALL=C ps -o pid=,lstart= -p "$1" 2>/dev/null)"
+	if [ -z "$out" ]; then
+		for p in $(printf '%s' "$1" | tr ',' ' '); do
+			out="$out$(LC_ALL=C ps -o pid=,lstart= -p "$p" 2>/dev/null)
+"
+		done
+	fi
+	printf '%s\n' "$out" | awk 'NF { p = $1; $1 = ""; s = $0; sub(/^ +/, "", s); print p "\t" s }'
+}
+
+# Remove state dirs whose shell is gone: meta "pid<TAB>lstart" no longer matches a live process
+# (pid reuse is caught by the start time). One ps call for all candidates.
+# AIDEV-NOTE: dot-dirs are in-progress inits (cmd_start) — never touch them. $1 = id to keep.
+gc_sweep() {
+	local root keep="${1:-}" d id pid pids="" live want n=0
+	root="$(state_root)"
+	[ -d "$root" ] || {
+		echo 0
+		return 0
+	}
+	for d in "$root"/*/; do
+		[ -d "$d" ] || continue
+		d="${d%/}"
+		id="${d##*/}"
+		[ "$id" = "$keep" ] && continue
+		pid="${id%%-*}"
+		case "$pid" in
+			'' | *[!0-9]*) continue ;;
+		esac
+		pids="$pids${pids:+,}$pid"
+	done
+	if [ -n "$pids" ]; then
+		live="$(live_procs "$pids")"
+		for d in "$root"/*/; do
+			[ -d "$d" ] || continue
+			d="${d%/}"
+			id="${d##*/}"
+			[ "$id" = "$keep" ] && continue
+			case "${id%%-*}" in
+				'' | *[!0-9]*) continue ;;
+			esac
+			want="$(cat "$d/meta" 2>/dev/null)"
+			if [ -z "$want" ] || ! printf '%s\n' "$live" | grep -qxF -- "$want"; then
+				rm -rf "$d" && n=$((n + 1))
+			fi
+		done
+	fi
+	echo "$n"
+}
+
+cmd_gc() {
+	local n
+	n="$(gc_sweep "${KUX_ID:-}")"
+	printf 'kux: removed %s stale shell state dir(s)\n' "$n"
 }
 
 # Recreate a lost state dir (swept, rebooted). Re-pins to the projection KUBECONFIG still names, if
@@ -356,6 +418,12 @@ kux() {
 	_kux_apply
 	return $rc
 }
+_kux_exit() {
+	[[ "${KUX_PID-}" == "$$" ]] || return 0
+	case "${KUX_STATE-}" in
+		*/kux/shells/*) command rm -rf "$KUX_STATE" ;;
+	esac
+}
 kux_prompt() {
 	printf '%s' "${_KUX_PROMPT-}"
 }
@@ -401,6 +469,7 @@ _kux_precmd() {
 }
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _kux_precmd
+add-zsh-hook zshexit _kux_exit
 EOF
 	else
 		cat <<'EOF'
@@ -416,6 +485,7 @@ case "${PROMPT_COMMAND-}" in
 	*) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND
 }_kux_precmd" ;;
 esac
+[[ -n "$(trap -p EXIT)" ]] || trap _kux_exit EXIT
 EOF
 	fi
 	cat <<'EOF'
@@ -825,6 +895,7 @@ main() {
 		unset) cmd_unset ;;
 		refresh) cmd_refresh ;;
 		promote) cmd_promote ;;
+		gc) cmd_gc ;;
 		ns) cmd_ns "$@" ;;
 		_nslist) list_namespaces "${1:-}" ;;
 		_prompt) cmd_prompt_refresh ;;
