@@ -92,6 +92,205 @@ resolve_context() {
 	printf '%s\n' "$hit"
 }
 
+state_root() {
+	printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/kux/shells"
+}
+
+clusters_dir() {
+	printf '%s' "${KUX_CLUSTERS_DIR:-$HOME/.kube/clusters}"
+}
+
+# 'it''s' — YAML single-quoted scalar.
+yq() {
+	local q="'"
+	printf "'%s'" "${1//$q/$q$q}"
+}
+
+# 'it'\''s' — shell single-quoted word.
+shq() {
+	local q="'"
+	printf "'%s'" "${1//$q/$q\\$q$q}"
+}
+
+# Tab-separated view of a kubeconfig list (names only; no secrets are printed):
+#   cc<TAB>current-context
+#   ctx<TAB>name<TAB>cluster<TAB>user<TAB>namespace   (one per context)
+#   foreign<TAB>clusters|users                        (if present)
+kc_table() {
+	KUBECONFIG="$1" kubectl config view -o go-template='{{"cc\t"}}{{with index . "current-context"}}{{.}}{{end}}{{"\n"}}{{range .contexts}}{{"ctx\t"}}{{.name}}{{"\t"}}{{.context.cluster}}{{"\t"}}{{.context.user}}{{"\t"}}{{with .context.namespace}}{{.}}{{end}}{{"\n"}}{{end}}{{if .clusters}}{{"foreign\tclusters\n"}}{{end}}{{if .users}}{{"foreign\tusers\n"}}{{end}}' 2>/dev/null
+}
+
+# "cluster<TAB>user<TAB>namespace" of context $2 in table $1.
+table_ctx() {
+	printf '%s\n' "$1" | awk -F'\t' -v n="$2" '$1 == "ctx" && $2 == n { print $3 "\t" $4 "\t" $5; exit }'
+}
+
+table_cc() {
+	printf '%s\n' "$1" | awk -F'\t' '$1 == "cc" { print $2; exit }'
+}
+
+# Atomic write: stdin -> $1.
+write_file() {
+	local tmp="$1.tmp.$$"
+	cat >"$tmp" && mv -f "$tmp" "$1"
+}
+
+# AIDEV-NOTE: the overlay MUST carry a full stanza (cluster+user) for its current-context: context
+# entries don't deep-merge, and without a stanza `kubectl config set-context --namespace` rewrites
+# the user's real kubeconfig (DESIGN §3).
+write_overlay() {
+	local ctx="$1" cluster="$2" user="$3" ns="$4"
+	{
+		printf 'apiVersion: v1\nkind: Config\n'
+		if [ -n "$ctx" ]; then
+			printf 'current-context: %s\ncontexts:\n- name: %s\n  context:\n' "$(yq "$ctx")" "$(yq "$ctx")"
+			printf '    cluster: %s\n    user: %s\n' "$(yq "$cluster")" "$(yq "$user")"
+			[ -n "$ns" ] && printf '    namespace: %s\n' "$(yq "$ns")"
+		fi
+	} | write_file "$KUX_STATE/overlay.yaml"
+	chmod 600 "$KUX_STATE/overlay.yaml"
+}
+
+# Overlay for the unpinned state: mirror the real config's current context so that writes from
+# kubectl/kubens in this shell land in the overlay rather than the real config.
+write_unpinned_overlay() {
+	local table cc info
+	table="$(kc_table "$(orig_kubeconfig)")"
+	cc="$(table_cc "$table")"
+	info=""
+	[ -n "$cc" ] && info="$(table_ctx "$table" "$cc")"
+	if [ -n "$info" ]; then
+		write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" \
+			"$(printf '%s' "$info" | cut -f3)"
+	else
+		write_overlay "" "" "" ""
+	fi
+	rm -f "$KUX_STATE/cluster_file"
+}
+
+# Queue an environment change for the shim to source after this process exits.
+emit_env() {
+	printf '%s\n' "$*" >>"$KUX_STATE/env"
+}
+
+emit_kubeconfig() {
+	emit_env "export KUBECONFIG=$(shq "$1"); _KUX_KUBECONFIG=$(shq "$1")"
+}
+
+emit_unpinned() {
+	emit_kubeconfig "$KUX_STATE/overlay.yaml:$(orig_kubeconfig)"
+	emit_env "unset KUX_CLUSTER_FILE"
+}
+
+proc_start() {
+	LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'
+}
+
+write_meta() {
+	printf '%s\t%s\n' "$1" "$(proc_start "$1")" | write_file "$KUX_STATE/meta"
+}
+
+# Called by the shim at init: `eval "$(kux _start $$)"`. Mints a shell id unless this exact shell
+# already owns one (re-sourced rc file), in which case KUBECONFIG is left alone.
+cmd_start() {
+	local pid="$1" id dir tmpdir orig
+	if [ -n "${KUX_ID:-}" ] && [ "${KUX_PID:-}" = "$pid" ] && [ -d "${KUX_STATE:-/nonexistent}" ]; then
+		[ -f "$KUX_STATE/overlay.yaml" ] || heal_state >&2
+		return
+	fi
+	# AIDEV-NOTE: an inherited KUX_ID (nested shell, tmux server env) belongs to another shell;
+	# mint a fresh one but keep the inherited original KUBECONFIG.
+	orig="${KUX_ORIG_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+	id="$pid-$RANDOM$RANDOM$RANDOM"
+	dir="$(state_root)/$id"
+	tmpdir="$(state_root)/.$id.tmp"
+	mkdir -p "$tmpdir" || die "cannot create $tmpdir"
+	chmod 700 "$tmpdir"
+	KUX_ORIG_KUBECONFIG="$orig"
+	KUX_STATE="$tmpdir"
+	write_meta "$pid"
+	write_unpinned_overlay
+	mv "$tmpdir" "$dir"
+	KUX_STATE="$dir"
+	printf 'export KUX_ID=%s KUX_PID=%s KUX_STATE=%s KUX_ORIG_KUBECONFIG=%s\n' \
+		"$(shq "$id")" "$(shq "$pid")" "$(shq "$dir")" "$(shq "$orig")"
+	# shellcheck disable=SC2016 # expanded by the shell that evals this
+	printf 'export KUBECONFIG=%s; _KUX_KUBECONFIG="$KUBECONFIG"\n' \
+		"$(shq "$dir/overlay.yaml:$orig")"
+	printf 'unset KUX_CLUSTER_FILE\n'
+}
+
+# Recreate a lost state dir (swept, rebooted). Re-pins to the projection KUBECONFIG still names, if
+# any; the namespace is lost.
+heal_state() {
+	local second proj cc info
+	mkdir -p "$KUX_STATE" && chmod 700 "$KUX_STATE"
+	write_meta "${KUX_PID:-$PPID}"
+	second="${KUBECONFIG#*:}"
+	second="${second%%:*}"
+	case "$second" in
+		"$(clusters_dir)"/*.yaml)
+			if [ -f "$second" ]; then
+				proj="$second"
+			fi
+			;;
+	esac
+	if [ -n "${proj:-}" ]; then
+		cc="$(table_cc "$(kc_table "$proj")")"
+		info="$(table_ctx "$(kc_table "$proj")" "$cc")"
+		write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" ""
+		printf '%s\n' "$proj" >"$KUX_STATE/cluster_file"
+		printf 'kux: state for this shell was lost; restored context %s (namespace reset)\n' "$cc"
+	else
+		write_unpinned_overlay
+		emit_unpinned
+		printf 'kux: state for this shell was lost; recreated (unpinned)\n'
+	fi
+}
+
+# Every state-changing command needs the shim (it is what applies KUBECONFIG to the shell).
+require_shell() {
+	[ -n "${KUX_ID:-}" ] && [ -n "${KUX_STATE:-}" ] \
+		|| die "shell integration not loaded; add to your rc file: eval \"\$(kux init zsh)\""
+	if [ ! -f "$KUX_STATE/overlay.yaml" ]; then
+		heal_state >&2
+	fi
+}
+
+self_path() {
+	local d
+	d="$(cd "$(dirname "$0")" && pwd)" || die "cannot locate kux"
+	printf '%s/%s' "$d" "$(basename "$0")"
+}
+
+# AIDEV-NOTE: this text is eval'd in the user's interactive shell — zsh and bash both parse it.
+# Keep it fork-free except around actual kux invocations.
+cmd_init() {
+	local sh="${1:-}"
+	case "$sh" in
+		zsh | bash) ;;
+		*) die "usage: kux init zsh|bash [--no-prompt]" ;;
+	esac
+	cat <<EOF
+# kux shell integration ($sh) — generated by: kux init $sh
+_KUX_BIN=$(shq "$(self_path)")
+_kux_apply() {
+	if [[ -n "\${KUX_STATE-}" && -f "\$KUX_STATE/env" ]]; then
+		. "\$KUX_STATE/env"
+		command rm -f "\$KUX_STATE/env"
+	fi
+}
+kux() {
+	"\$_KUX_BIN" "\$@"
+	local rc=\$?
+	_kux_apply
+	return \$rc
+}
+eval "\$("\$_KUX_BIN" _start \$\$)"
+_kux_apply
+EOF
+}
+
 cmd_ctx() {
 	if [ $# -eq 0 ]; then
 		alias_table | cut -f1
@@ -107,6 +306,9 @@ main() {
 		-h | --help | help) usage ;;
 		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
 		ctx) cmd_ctx "$@" ;;
+		init) cmd_init "$@" ;;
+		_start) cmd_start "${1:?pid}" ;;
+		_require_shell) require_shell ;;
 		_aliases) alias_table ;;
 		_resolve) resolve_context "$1" ;;
 		*)
