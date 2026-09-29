@@ -633,6 +633,162 @@ cmd_ns() {
 	set_namespace "$want"
 }
 
+first_orig_file() {
+	local o
+	o="$(orig_kubeconfig)"
+	printf '%s' "${o%%:*}"
+}
+
+json_str() {
+	printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+# Markers as in the prompt (DESIGN §6), computed here with forks allowed.
+status_markers() {
+	local cf expected
+	if [ ! -f "$KUX_STATE/overlay.yaml" ]; then
+		echo "?"
+		return
+	fi
+	[ -n "$(overlay_foreign)" ] && echo "!promote"
+	if [ -s "$KUX_STATE/cluster_file" ]; then
+		cf="$(cat "$KUX_STATE/cluster_file")"
+		projection_stale "$cf" && echo "!stale"
+		expected="$KUX_STATE/overlay.yaml:$cf"
+	else
+		expected="$KUX_STATE/overlay.yaml:$(orig_kubeconfig)"
+	fi
+	[ "${KUBECONFIG:-}" = "$expected" ] || echo "!edited"
+}
+
+cmd_status() {
+	local json="" ctx="" ns="" a="" cf="" markers="" pinned=false m
+	[ "${1:-}" = "--json" ] && json=1
+	if [ -z "${KUX_STATE:-}" ]; then
+		ctx="$(kubectl config current-context 2>/dev/null)"
+		if [ -n "$json" ]; then
+			printf '{"shell":false,"context":%s}\n' "$(json_str "$ctx")"
+		else
+			printf 'kux shell integration not loaded (context: %s)\n' "${ctx:-none}"
+		fi
+		return
+	fi
+	[ -f "$KUX_STATE/overlay.yaml" ] || heal_state >&2
+	if [ -f "$KUX_STATE/overlay.yaml" ]; then
+		ctx="$(overlay_ctx)"
+		ns="$(overlay_ns)"
+		a="$(alias_of "$ctx")"
+	fi
+	if [ -s "$KUX_STATE/cluster_file" ]; then
+		cf="$(cat "$KUX_STATE/cluster_file")"
+		pinned=true
+	fi
+	markers="$(status_markers)"
+	if [ -n "$json" ]; then
+		printf '{"shell":true,"id":%s,"context":%s,"alias":%s,"namespace":%s,' \
+			"$(json_str "${KUX_ID:-}")" "$(json_str "$ctx")" "$(json_str "$a")" \
+			"$(json_str "${ns:-default}")"
+		printf '"pinned":%s,"cluster_file":%s,"kubeconfig":%s,"markers":[' \
+			"$pinned" "$(json_str "$cf")" "$(json_str "${KUBECONFIG:-}")"
+		local sep=""
+		for m in $markers; do
+			printf '%s%s' "$sep" "$(json_str "$m")"
+			sep=","
+		done
+		printf ']}\n'
+		return
+	fi
+	printf 'context:   %s' "${a:-$ctx}"
+	[ -n "$a" ] && [ "$a" != "$ctx" ] && printf ' (%s)' "$ctx"
+	printf '\nnamespace: %s\n' "${ns:-default}"
+	if [ "$pinned" = true ]; then
+		printf 'mode:      pinned (%s)\n' "$cf"
+	else
+		printf 'mode:      unpinned (all contexts visible)\n'
+	fi
+	for m in $markers; do
+		case "$m" in
+			"?") echo "warning:   overlay missing; the next kux command recreates it" ;;
+			"!promote") echo "warning:   clusters/users were written into the overlay; run: kux promote" ;;
+			"!stale") echo "warning:   kubeconfig changed since the cluster file was made; run: kux refresh" ;;
+			"!edited") echo "warning:   KUBECONFIG was changed by hand; kux ctx/unset will reset it" ;;
+		esac
+	done
+}
+
+cmd_unset() {
+	local cur
+	require_shell
+	cur="$(overlay_ctx)"
+	[ -n "$cur" ] && printf '%s\n' "$cur" >"$KUX_STATE/prev_ctx"
+	write_unpinned_overlay
+	emit_unpinned
+	write_prompt
+	printf 'kux: unpinned (context %s)\n' "$(overlay_ctx)" >&2
+}
+
+drop_ns_cache() {
+	rm -f "$(cache_dir)/$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+}
+
+cmd_refresh() {
+	local real a
+	require_shell
+	load_aliases
+	real="$(overlay_ctx)"
+	[ -n "$real" ] && drop_ns_cache "$real"
+	if [ ! -s "$KUX_STATE/cluster_file" ]; then
+		write_prompt
+		printf 'kux: unpinned; namespace cache cleared\n' >&2
+		return
+	fi
+	a="$(alias_of "$real")"
+	[ -n "$a" ] || die "context $real is no longer in $(orig_kubeconfig); run: kux unset"
+	remember_ns "$real"
+	ensure_projection "$a" "$real" force
+	pin_context "$a" "$real"
+	printf 'kux: refreshed %s\n' "$a" >&2
+}
+
+# Move clusters/users/contexts another tool wrote into the overlay into the real kubeconfig.
+# AIDEV-NOTE: the real file is rewritten by kubectl (comments/order lost) — backup first. The real
+# file comes FIRST in the merge so its existing entries always win.
+cmd_promote() {
+	local target t cc info cf pc
+	require_shell
+	if [ -z "$(overlay_foreign)" ]; then
+		echo "kux: nothing to promote"
+		return
+	fi
+	target="$(first_orig_file)"
+	[ -f "$target" ] && cp -p "$target" "$target.kux-bak"
+	(
+		umask 077
+		KUBECONFIG="$target:$KUX_STATE/overlay.yaml" kubectl config view --raw >"$target.tmp.$$"
+	) || {
+		rm -f "$target.tmp.$$"
+		die "could not merge into $target"
+	}
+	mv -f "$target.tmp.$$" "$target"
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	info="$(table_ctx "$t" "$cc")"
+	cf=""
+	[ -s "$KUX_STATE/cluster_file" ] && cf="$(cat "$KUX_STATE/cluster_file")"
+	if [ -n "$cf" ]; then
+		pc="$(table_cc "$(kc_table "$cf")")"
+		if [ "$pc" != "$cc" ]; then
+			cc="$pc"
+			info="$(table_ctx "$t" "$cc")"
+			[ -n "$info" ] || info="$(table_ctx "$(kc_table "$cf")" "$cc")"
+		fi
+	fi
+	KUX_CLOBBER=1 write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" \
+		"$(printf '%s' "$info" | cut -f2)" "$(printf '%s' "$info" | cut -f3)"
+	write_prompt
+	printf 'kux: promoted into %s (backup: %s.kux-bak)\n' "$target" "$target"
+}
+
 cmd_ctx() {
 	local want hit
 	if [ $# -eq 0 ] && ! is_tty; then
@@ -664,7 +820,11 @@ main() {
 	case "$cmd" in
 		-h | --help | help) usage ;;
 		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
+		status) cmd_status "$@" ;;
 		ctx) cmd_ctx "$@" ;;
+		unset) cmd_unset ;;
+		refresh) cmd_refresh ;;
+		promote) cmd_promote ;;
 		ns) cmd_ns "$@" ;;
 		_nslist) list_namespaces "${1:-}" ;;
 		_prompt) cmd_prompt_refresh ;;
