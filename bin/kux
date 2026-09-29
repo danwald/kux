@@ -43,6 +43,23 @@ kc_orig() {
 # alias<TAB>real-name for every context in the real kubeconfig (DESIGN §5).
 # AIDEV-NOTE: collisions are resolved over the whole list; aliases double as projection filenames.
 alias_table() {
+	if [ -n "${_ALIASES+x}" ]; then
+		[ -n "$_ALIASES" ] && printf '%s\n' "$_ALIASES"
+		return
+	fi
+	compute_alias_table
+}
+
+# Callers in this process that need the table repeatedly should run `load_aliases` first.
+load_aliases() {
+	_ALIASES="$(compute_alias_table)"
+}
+
+alias_of() {
+	alias_table | awk -F'\t' -v n="$1" '$2 == n { print $1; exit }'
+}
+
+compute_alias_table() {
 	kc_orig config get-contexts -o name 2>/dev/null | awk '
 		function san(s) { gsub(/[\/:]/, "_", s); return s }
 		NF {
@@ -291,12 +308,107 @@ _kux_apply
 EOF
 }
 
+projection_path() {
+	printf '%s/%s.yaml' "$(clusters_dir)" "$1"
+}
+
+# True if any file of the original KUBECONFIG list is newer than projection $1.
+projection_stale() {
+	local rest f
+	rest="$(orig_kubeconfig):"
+	[ -f "$1" ] || return 0
+	while [ -n "$rest" ]; do
+		f="${rest%%:*}"
+		rest="${rest#*:}"
+		[ -n "$f" ] && [ "$f" -nt "$1" ] && return 0
+	done
+	return 1
+}
+
+# Make sure ~/.kube/clusters/<alias>.yaml is a fresh single-context projection of $2.
+# AIDEV-NOTE: projection must run against the ORIGINAL kubeconfig: with the overlay first in
+# KUBECONFIG, --minify would minify the overlay instead (DESIGN §3.5).
+ensure_projection() {
+	local alias="$1" real="$2" force="${3:-}" p dir
+	p="$(projection_path "$alias")"
+	if [ -z "$force" ] && ! projection_stale "$p" \
+		&& [ "$(table_cc "$(kc_table "$p")")" = "$real" ]; then
+		return
+	fi
+	dir="$(clusters_dir)"
+	mkdir -p "$dir" && chmod 700 "$dir"
+	(
+		umask 077
+		kc_orig config view --raw --minify --flatten --context="$real" >"$p.tmp.$$"
+	) || {
+		rm -f "$p.tmp.$$"
+		die "could not extract context $real"
+	}
+	mv -f "$p.tmp.$$" "$p"
+}
+
+# Current context as recorded in this shell's overlay.
+overlay_ctx() {
+	table_cc "$(kc_table "$KUX_STATE/overlay.yaml")"
+}
+
+overlay_ns() {
+	local t cc
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	[ -n "$cc" ] && table_ctx "$t" "$cc" | cut -f3
+}
+
+# Pin this shell to real context $2 (alias $1).
+pin_context() {
+	local alias="$1" real="$2" p info ns cur
+	cur="$(overlay_ctx)"
+	ensure_projection "$alias" "$real"
+	p="$(projection_path "$alias")"
+	info="$(table_ctx "$(kc_table "$p")" "$real")"
+	[ -n "$info" ] || die "context $real not found in $p"
+	if [ -n "$cur" ] && [ "$cur" != "$real" ]; then
+		remember_ns "$cur"
+		printf '%s\n' "$cur" >"$KUX_STATE/prev_ctx"
+	fi
+	ns="$(printf '%s' "$info" | cut -f3)"
+	[ -f "$KUX_STATE/ns/$alias" ] && ns="$(cat "$KUX_STATE/ns/$alias")"
+	write_overlay "$real" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" "$ns"
+	printf '%s\n' "$p" >"$KUX_STATE/cluster_file"
+	emit_kubeconfig "$KUX_STATE/overlay.yaml:$p"
+	emit_env "export KUX_CLUSTER_FILE=$(shq "$p")"
+}
+
+# Save the overlay's namespace for context $1 so switching back restores it.
+remember_ns() {
+	local a ns
+	a="$(alias_of "$1")"
+	[ -n "$a" ] || return 0
+	ns="$(overlay_ns)"
+	mkdir -p "$KUX_STATE/ns"
+	if [ -n "$ns" ]; then
+		printf '%s\n' "$ns" >"$KUX_STATE/ns/$a"
+	else
+		rm -f "$KUX_STATE/ns/$a"
+	fi
+}
+
 cmd_ctx() {
+	local want hit
 	if [ $# -eq 0 ]; then
 		alias_table | cut -f1
 		return
 	fi
-	die "switching contexts is not implemented yet"
+	want="$1"
+	require_shell
+	load_aliases
+	if [ "$want" = "-" ]; then
+		[ -s "$KUX_STATE/prev_ctx" ] || die "no previous context in this shell"
+		want="$(cat "$KUX_STATE/prev_ctx")"
+	fi
+	hit="$(resolve_context "$want")" || exit 1
+	pin_context "${hit%%	*}" "${hit#*	}"
+	printf 'kux: context %s\n' "${hit%%	*}" >&2
 }
 
 main() {
