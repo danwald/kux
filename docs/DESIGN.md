@@ -31,7 +31,7 @@ deliberately.
 | `~/.kube/config` (or the original `KUBECONFIG` list) | Source of truth, managed by your tooling |
 | `~/.kube/clusters/<alias>.yaml` | Projection: single-context file, `0600`, via `kubectl config view --raw --minify --flatten` |
 | `$XDG_STATE_HOME/kux/shells/<id>/` | Per-shell state (see below) |
-| `$XDG_CACHE_HOME/kux/ns/<cksum>` | Namespace list per real context name, TTL 300 s, shared |
+| `$XDG_CACHE_HOME/kux/ns/<cksum>` | Namespace list per real context name (first line: fetch epoch), TTL `KUX_NS_TTL` = 300 s, shared |
 
 Per-shell state directory:
 

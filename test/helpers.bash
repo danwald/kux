@@ -28,6 +28,7 @@ kux_setup() {
 #!/bin/bash
 if [ "${1:-}" = get ] && { [ "${2:-}" = namespaces ] || [ "${2:-}" = ns ]; }; then
 	echo "get namespaces ${KUBECONFIG:-}" >> "$KUX_TEST_API_LOG"
+	[ -n "${KUX_TEST_NS_FAIL:-}" ] && { echo "unreachable" >&2; exit 1; }
 	sed 's|^|namespace/|' "$KUX_TEST_NAMESPACES"
 	exit 0
 fi

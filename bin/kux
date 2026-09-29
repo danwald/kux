@@ -393,6 +393,86 @@ remember_ns() {
 	fi
 }
 
+cache_dir() {
+	printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/kux/ns"
+}
+
+# Context the shell is actually on: the overlay when in a kux shell, else kubectl's view.
+current_ctx() {
+	if [ -n "${KUX_STATE:-}" ] && [ -f "$KUX_STATE/overlay.yaml" ]; then
+		overlay_ctx
+	else
+		kubectl config current-context 2>/dev/null
+	fi
+}
+
+# Namespaces of the current cluster, cached per real context for KUX_NS_TTL seconds.
+# Cache file: first line is the fetch epoch, then one namespace per line.
+list_namespaces() {
+	local refresh="${1:-}" ctx f out fetched
+	ctx="$(current_ctx)"
+	[ -n "$ctx" ] || die "no current context"
+	f="$(cache_dir)/$(printf '%s' "$ctx" | cksum | cut -d' ' -f1)"
+	if [ -z "$refresh" ] && [ -f "$f" ]; then
+		read -r fetched <"$f"
+		if [ $(($(date +%s) - ${fetched:-0})) -lt "${KUX_NS_TTL:-300}" ]; then
+			tail -n +2 "$f"
+			return
+		fi
+	fi
+	if out="$(kubectl get namespaces -o name --request-timeout=5s 2>/dev/null)"; then
+		mkdir -p "$(cache_dir)"
+		{
+			date +%s
+			printf '%s\n' "$out" | sed 's|^namespace/||'
+		} | write_file "$f"
+		tail -n +2 "$f"
+	elif [ -f "$f" ]; then
+		printf 'kux: cannot reach %s; showing cached namespaces\n' "$ctx" >&2
+		tail -n +2 "$f"
+	else
+		die "cannot list namespaces for $ctx (cluster unreachable?)"
+	fi
+}
+
+# Set this shell's namespace. The stanza comes from the merged view so an overlay whose
+# current-context was changed externally (no stanza of its own yet) is repaired, not broken.
+set_namespace() {
+	local ns="$1" ctx info a old
+	ctx="$(overlay_ctx)"
+	[ -n "$ctx" ] || die "no current context"
+	info="$(table_ctx "$(kc_table "$KUBECONFIG")" "$ctx")"
+	[ -n "$info" ] || die "context $ctx not found"
+	old="$(printf '%s' "$info" | cut -f3)"
+	write_overlay "$ctx" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" "$ns"
+	a="$(alias_of "$ctx")"
+	if [ -n "$a" ]; then
+		mkdir -p "$KUX_STATE/ns" "$KUX_STATE/prevns"
+		printf '%s\n' "$ns" >"$KUX_STATE/ns/$a"
+		[ "$old" != "$ns" ] && printf '%s\n' "${old:-default}" >"$KUX_STATE/prevns/$a"
+	fi
+	printf 'kux: namespace %s\n' "$ns" >&2
+}
+
+cmd_ns() {
+	local want a
+	case "${1:-}" in
+		"" | -r | --refresh)
+			list_namespaces "${1:-}"
+			return
+			;;
+	esac
+	want="$1"
+	require_shell
+	load_aliases
+	if [ "$want" = "-" ]; then
+		a="$(alias_of "$(overlay_ctx)")"
+		[ -n "$a" ] && [ -s "$KUX_STATE/prevns/$a" ] || die "no previous namespace for this context"
+		want="$(cat "$KUX_STATE/prevns/$a")"
+	fi
+	set_namespace "$want"
+}
+
 cmd_ctx() {
 	local want hit
 	if [ $# -eq 0 ]; then
@@ -418,6 +498,7 @@ main() {
 		-h | --help | help) usage ;;
 		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
 		ctx) cmd_ctx "$@" ;;
+		ns) cmd_ns "$@" ;;
 		init) cmd_init "$@" ;;
 		_start) cmd_start "${1:?pid}" ;;
 		_require_shell) require_shell ;;
