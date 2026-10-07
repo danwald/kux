@@ -31,6 +31,24 @@ make bump BUMP=minor
   `$KUX_STATE/env` (see DESIGN §2).
 - Any `kubectl config view --minify` must set `KUBECONFIG` to the original list explicitly.
 - The overlay must always contain a full stanza for its `current-context` (DESIGN §3.3).
+- `write_overlay` refuses while the overlay holds foreign clusters/users; only `kux promote`
+  passes `KUX_CLOBBER=1`, after merging them into the real config.
+- `gc_sweep` must skip dot-dirs (in-progress inits) and the caller's own id; BSD `ps -p a,b`
+  prints nothing if one pid is out of range (see `live_procs`).
+- BSD tools: `sed -i ''`, `touch -t STAMP FILE` (options before operands), `stat -f`.
+
+## 3.1 Where to test what
+
+| Feature | Test file |
+|---|---|
+| alias derivation, name resolution | `test/aliases.bats` |
+| init, shim, per-shell state, heal | `test/init.bats` |
+| pin / toggle / projections | `test/ctx.bats` |
+| namespaces + cache | `test/ns.bats` |
+| fzf / `select` picker | `test/picker.bats` |
+| prompt segment + markers | `test/prompt.bats` |
+| status, unset, refresh, promote | `test/commands.bats` |
+| sweep + exit hooks | `test/gc.bats` |
 
 ## 4. Glossary
 

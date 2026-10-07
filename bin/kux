@@ -30,12 +30,879 @@ die() {
 	exit 1
 }
 
+# The user's real kubeconfig list — never the per-shell one.
+orig_kubeconfig() {
+	printf '%s' "${KUX_ORIG_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+}
+
+# kubectl against the real kubeconfig.
+kc_orig() {
+	KUBECONFIG="$(orig_kubeconfig)" kubectl "$@"
+}
+
+# alias<TAB>real-name for every context in the real kubeconfig (DESIGN §5).
+# AIDEV-NOTE: collisions are resolved over the whole list; aliases double as projection filenames.
+alias_table() {
+	if [ -n "${_ALIASES+x}" ]; then
+		[ -n "$_ALIASES" ] && printf '%s\n' "$_ALIASES"
+		return
+	fi
+	compute_alias_table
+}
+
+# Callers in this process that need the table repeatedly should run `load_aliases` first.
+load_aliases() {
+	_ALIASES="$(compute_alias_table)"
+}
+
+alias_of() {
+	alias_table | awk -F'\t' -v n="$1" '$2 == n { print $1; exit }'
+}
+
+compute_alias_table() {
+	kc_orig config get-contexts -o name 2>/dev/null | awk '
+		function san(s) { gsub(/[\/:]/, "_", s); return s }
+		NF {
+			n[++c] = $0; base = ""; dis = ""
+			if ($0 ~ /^arn:aws:eks:[^:]*:[0-9]+:cluster\/./) {
+				split($0, p, ":"); dis = p[5]
+				base = substr($0, index($0, ":cluster/") + 9)
+			} else if ($0 ~ /^gke_[^_]+_[^_]+_[^_]+$/) {
+				split($0, p, "_"); base = p[4]; dis = p[2]
+			}
+			base = (base == "") ? san($0) : san(base)
+			b[c] = base; d[c] = dis; cnt1[base]++
+		}
+		END {
+			for (i = 1; i <= c; i++) {
+				a[i] = b[i]
+				if (cnt1[b[i]] > 1) a[i] = (d[i] != "") ? b[i] "@" d[i] : san(n[i])
+				cnt2[a[i]]++
+			}
+			for (i = 1; i <= c; i++) {
+				if (cnt2[a[i]] > 1) a[i] = san(n[i])
+				print a[i] "\t" n[i]
+			}
+		}'
+}
+
+# Resolve user input to "alias<TAB>real" (DESIGN §4): exact real name, exact alias, then a unique
+# alias substring. Ambiguity is an error — never guess on a machine with prod in it.
+resolve_context() {
+	local want="$1" table hit
+	table="$(alias_table)"
+	[ -n "$table" ] || die "no contexts found in $(orig_kubeconfig)"
+	hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" '$2 == w' | head -1)"
+	[ -n "$hit" ] || hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" '$1 == w' | head -1)"
+	if [ -z "$hit" ]; then
+		hit="$(printf '%s\n' "$table" | awk -F'\t' -v w="$want" 'index($1, w)')"
+		case "$hit" in
+			"") die "no context matches '$want' (see: kux ctx)" ;;
+			*"
+"*)
+				printf 'kux: %s is ambiguous:\n' "'$want'" >&2
+				printf '%s\n' "$hit" | awk -F'\t' '{ printf "  %-24s %s\n", $1, $2 }' >&2
+				exit 1
+				;;
+		esac
+	fi
+	printf '%s\n' "$hit"
+}
+
+state_root() {
+	printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/kux/shells"
+}
+
+clusters_dir() {
+	printf '%s' "${KUX_CLUSTERS_DIR:-$HOME/.kube/clusters}"
+}
+
+# 'it''s' — YAML single-quoted scalar.
+yq() {
+	local q="'"
+	printf "'%s'" "${1//$q/$q$q}"
+}
+
+# 'it'\''s' — shell single-quoted word.
+shq() {
+	local q="'"
+	printf "'%s'" "${1//$q/$q\\$q$q}"
+}
+
+# Tab-separated view of a kubeconfig list (names only; no secrets are printed):
+#   cc<TAB>current-context
+#   ctx<TAB>name<TAB>cluster<TAB>user<TAB>namespace   (one per context)
+#   foreign<TAB>clusters|users                        (if present)
+kc_table() {
+	KUBECONFIG="$1" kubectl config view -o go-template='{{"cc\t"}}{{with index . "current-context"}}{{.}}{{end}}{{"\n"}}{{range .contexts}}{{"ctx\t"}}{{.name}}{{"\t"}}{{.context.cluster}}{{"\t"}}{{.context.user}}{{"\t"}}{{with .context.namespace}}{{.}}{{end}}{{"\n"}}{{end}}{{if .clusters}}{{"foreign\tclusters\n"}}{{end}}{{if .users}}{{"foreign\tusers\n"}}{{end}}' 2>/dev/null
+}
+
+# "cluster<TAB>user<TAB>namespace" of context $2 in table $1.
+table_ctx() {
+	printf '%s\n' "$1" | awk -F'\t' -v n="$2" '$1 == "ctx" && $2 == n { print $3 "\t" $4 "\t" $5; exit }'
+}
+
+table_cc() {
+	printf '%s\n' "$1" | awk -F'\t' '$1 == "cc" { print $2; exit }'
+}
+
+# Atomic write: stdin -> $1.
+write_file() {
+	local tmp="$1.tmp.$$"
+	cat >"$tmp" && mv -f "$tmp" "$1"
+}
+
+# AIDEV-NOTE: the overlay MUST carry a full stanza (cluster+user) for its current-context: context
+# entries don't deep-merge, and without a stanza `kubectl config set-context --namespace` rewrites
+# the user's real kubeconfig (DESIGN §3).
+write_overlay() {
+	local ctx="$1" cluster="$2" user="$3" ns="$4"
+	# AIDEV-NOTE: never silently drop clusters/users another tool wrote into the overlay (DESIGN §6).
+	if [ -z "${KUX_CLOBBER:-}" ] && [ -f "$KUX_STATE/overlay.yaml" ] \
+		&& [ -n "$(overlay_foreign)" ]; then
+		die "another tool wrote clusters/users into this shell's overlay; run 'kux promote' first"
+	fi
+	{
+		printf 'apiVersion: v1\nkind: Config\n'
+		if [ -n "$ctx" ]; then
+			printf 'current-context: %s\ncontexts:\n- name: %s\n  context:\n' "$(yq "$ctx")" "$(yq "$ctx")"
+			printf '    cluster: %s\n    user: %s\n' "$(yq "$cluster")" "$(yq "$user")"
+			[ -n "$ns" ] && printf '    namespace: %s\n' "$(yq "$ns")"
+		fi
+	} | write_file "$KUX_STATE/overlay.yaml"
+	chmod 600 "$KUX_STATE/overlay.yaml"
+}
+
+# Overlay for the unpinned state: mirror the real config's current context so that writes from
+# kubectl/kubens in this shell land in the overlay rather than the real config.
+write_unpinned_overlay() {
+	local table cc info
+	table="$(kc_table "$(orig_kubeconfig)")"
+	cc="$(table_cc "$table")"
+	info=""
+	[ -n "$cc" ] && info="$(table_ctx "$table" "$cc")"
+	if [ -n "$info" ]; then
+		write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" \
+			"$(printf '%s' "$info" | cut -f3)"
+	else
+		write_overlay "" "" "" ""
+	fi
+	rm -f "$KUX_STATE/cluster_file"
+}
+
+# Queue an environment change for the shim to source after this process exits.
+emit_env() {
+	printf '%s\n' "$*" >>"$KUX_STATE/env"
+}
+
+emit_kubeconfig() {
+	emit_env "export KUBECONFIG=$(shq "$1"); _KUX_KUBECONFIG=$(shq "$1")"
+}
+
+emit_unpinned() {
+	emit_kubeconfig "$KUX_STATE/overlay.yaml:$(orig_kubeconfig)"
+	emit_env "unset KUX_CLUSTER_FILE"
+}
+
+proc_start() {
+	LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'
+}
+
+write_meta() {
+	printf '%s\t%s\n' "$1" "$(proc_start "$1")" | write_file "$KUX_STATE/meta"
+}
+
+# "clusters"/"users" lines if something other than kux wrote those into the overlay.
+overlay_foreign() {
+	kc_table "$KUX_STATE/overlay.yaml" | awk -F'\t' '$1 == "foreign" { print $2 }'
+}
+
+# Render $KUX_STATE/prompt: "☸ <alias>:<ns>" plus "!promote" for foreign entries. The shim adds the
+# markers it can compute without forking (missing overlay, !stale, !edited).
+# AIDEV-NOTE: \ $ ` % are replaced so the text is inert in both zsh RPROMPT and bash PS1.
+write_prompt() {
+	local t cc info a ns text
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	if [ -z "$cc" ]; then
+		text="☸ -"
+	else
+		info="$(table_ctx "$t" "$cc")"
+		ns="$(printf '%s' "$info" | cut -f3)"
+		a="$(alias_of "$cc")"
+		text="☸ ${a:-$cc}:${ns:-default}"
+	fi
+	printf '%s' "$t" | grep -q '^foreign' && text="$text !promote"
+	printf '%s\n' "$text" | tr '\\$`%' '____' | write_file "$KUX_STATE/prompt"
+}
+
+# Called by the shim's prompt hook only when the overlay changed behind kux's back. Repairs a
+# current-context left without a stanza by an external `kubectl config use-context`.
+cmd_prompt_refresh() {
+	local t cc info
+	[ -n "${KUX_STATE:-}" ] && [ -f "$KUX_STATE/overlay.yaml" ] || return 0
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	if [ -n "$cc" ] && [ -z "$(table_ctx "$t" "$cc")" ] \
+		&& ! printf '%s' "$t" | grep -q '^foreign'; then
+		info="$(table_ctx "$(kc_table "$KUBECONFIG")" "$cc")"
+		[ -n "$info" ] && write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" \
+			"$(printf '%s' "$info" | cut -f2)" "$(printf '%s' "$info" | cut -f3)"
+	fi
+	write_prompt
+}
+
+# Called by the shim at init: `eval "$(kux _start $$)"`. Mints a shell id unless this exact shell
+# already owns one (re-sourced rc file), in which case KUBECONFIG is left alone.
+cmd_start() {
+	local pid="$1" id dir tmpdir orig
+	if [ -n "${KUX_ID:-}" ] && [ "${KUX_PID:-}" = "$pid" ] && [ -d "${KUX_STATE:-/nonexistent}" ]; then
+		[ -f "$KUX_STATE/overlay.yaml" ] || heal_state >&2
+		return
+	fi
+	# AIDEV-NOTE: an inherited KUX_ID (nested shell, tmux server env) belongs to another shell;
+	# mint a fresh one but keep the inherited original KUBECONFIG.
+	orig="${KUX_ORIG_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+	id="$pid-$RANDOM$RANDOM$RANDOM"
+	dir="$(state_root)/$id"
+	tmpdir="$(state_root)/.$id.tmp"
+	mkdir -p "$tmpdir" || die "cannot create $tmpdir"
+	chmod 700 "$tmpdir"
+	KUX_ORIG_KUBECONFIG="$orig"
+	KUX_STATE="$tmpdir"
+	write_meta "$pid"
+	write_unpinned_overlay
+	write_prompt
+	mv "$tmpdir" "$dir"
+	KUX_STATE="$dir"
+	gc_sweep "$id" >/dev/null 2>&1
+	printf 'export KUX_ID=%s KUX_PID=%s KUX_STATE=%s KUX_ORIG_KUBECONFIG=%s\n' \
+		"$(shq "$id")" "$(shq "$pid")" "$(shq "$dir")" "$(shq "$orig")"
+	# shellcheck disable=SC2016 # expanded by the shell that evals this
+	printf 'export KUBECONFIG=%s; _KUX_KUBECONFIG="$KUBECONFIG"\n' \
+		"$(shq "$dir/overlay.yaml:$orig")"
+	printf 'unset KUX_CLUSTER_FILE\n'
+}
+
+# "pid<TAB>lstart" per live pid of comma list $1.
+# AIDEV-NOTE: BSD ps prints nothing if ANY pid is out of range — then retry one pid at a time.
+live_procs() {
+	local out p
+	out="$(LC_ALL=C ps -o pid=,lstart= -p "$1" 2>/dev/null)"
+	if [ -z "$out" ]; then
+		for p in $(printf '%s' "$1" | tr ',' ' '); do
+			out="$out$(LC_ALL=C ps -o pid=,lstart= -p "$p" 2>/dev/null)
+"
+		done
+	fi
+	printf '%s\n' "$out" | awk 'NF { p = $1; $1 = ""; s = $0; sub(/^ +/, "", s); print p "\t" s }'
+}
+
+# Remove state dirs whose shell is gone: meta "pid<TAB>lstart" no longer matches a live process
+# (pid reuse is caught by the start time). One ps call for all candidates.
+# AIDEV-NOTE: dot-dirs are in-progress inits (cmd_start) — never touch them. $1 = id to keep.
+gc_sweep() {
+	local root keep="${1:-}" d id pid pids="" live want n=0
+	root="$(state_root)"
+	[ -d "$root" ] || {
+		echo 0
+		return 0
+	}
+	for d in "$root"/*/; do
+		[ -d "$d" ] || continue
+		d="${d%/}"
+		id="${d##*/}"
+		[ "$id" = "$keep" ] && continue
+		pid="${id%%-*}"
+		case "$pid" in
+			'' | *[!0-9]*) continue ;;
+		esac
+		pids="$pids${pids:+,}$pid"
+	done
+	if [ -n "$pids" ]; then
+		live="$(live_procs "$pids")"
+		for d in "$root"/*/; do
+			[ -d "$d" ] || continue
+			d="${d%/}"
+			id="${d##*/}"
+			[ "$id" = "$keep" ] && continue
+			case "${id%%-*}" in
+				'' | *[!0-9]*) continue ;;
+			esac
+			want="$(cat "$d/meta" 2>/dev/null)"
+			if [ -z "$want" ] || ! printf '%s\n' "$live" | grep -qxF -- "$want"; then
+				rm -rf "$d" && n=$((n + 1))
+			fi
+		done
+	fi
+	echo "$n"
+}
+
+cmd_gc() {
+	local n
+	n="$(gc_sweep "${KUX_ID:-}")"
+	printf 'kux: removed %s stale shell state dir(s)\n' "$n"
+}
+
+# Recreate a lost state dir (swept, rebooted). Re-pins to the projection KUBECONFIG still names, if
+# any; the namespace is lost.
+heal_state() {
+	local second proj cc info
+	mkdir -p "$KUX_STATE" && chmod 700 "$KUX_STATE"
+	write_meta "${KUX_PID:-$PPID}"
+	second="${KUBECONFIG#*:}"
+	second="${second%%:*}"
+	case "$second" in
+		"$(clusters_dir)"/*.yaml)
+			if [ -f "$second" ]; then
+				proj="$second"
+			fi
+			;;
+	esac
+	if [ -n "${proj:-}" ]; then
+		cc="$(table_cc "$(kc_table "$proj")")"
+		info="$(table_ctx "$(kc_table "$proj")" "$cc")"
+		write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" ""
+		printf '%s\n' "$proj" >"$KUX_STATE/cluster_file"
+		write_prompt
+		printf 'kux: state for this shell was lost; restored context %s (namespace reset)\n' "$cc"
+	else
+		write_unpinned_overlay
+		write_prompt
+		emit_unpinned
+		printf 'kux: state for this shell was lost; recreated (unpinned)\n'
+	fi
+}
+
+# Every state-changing command needs the shim (it is what applies KUBECONFIG to the shell).
+require_shell() {
+	[ -n "${KUX_ID:-}" ] && [ -n "${KUX_STATE:-}" ] \
+		|| die "shell integration not loaded; add to your rc file: eval \"\$(kux init zsh)\""
+	if [ ! -f "$KUX_STATE/overlay.yaml" ]; then
+		heal_state >&2
+	fi
+}
+
+self_path() {
+	local d
+	d="$(cd "$(dirname "$0")" && pwd)" || die "cannot locate kux"
+	printf '%s/%s' "$d" "$(basename "$0")"
+}
+
+# AIDEV-NOTE: this text is eval'd in the user's interactive shell and _kux_precmd runs on EVERY
+# prompt: builtins and [[ ]] tests only; it forks `kux _prompt` solely when the overlay is newer
+# than the prompt file (an external write). zsh and bash both parse the common part.
+cmd_init() {
+	local sh="${1:-}" noprompt=""
+	case "$sh" in
+		zsh | bash) ;;
+		*) die "usage: kux init zsh|bash [--no-prompt]" ;;
+	esac
+	[ "${2:-}" = "--no-prompt" ] && noprompt=1
+	cat <<EOF
+# kux shell integration ($sh) — generated by: kux init $sh${noprompt:+ --no-prompt}
+_KUX_BIN=$(shq "$(self_path)")
+_KUX_NO_PROMPT=$noprompt
+EOF
+	cat <<'EOF'
+_kux_apply() {
+	if [[ -n "${KUX_STATE-}" && -f "$KUX_STATE/env" ]]; then
+		. "$KUX_STATE/env"
+		command rm -f "$KUX_STATE/env"
+	fi
+}
+kux() {
+	"$_KUX_BIN" "$@"
+	local rc=$?
+	_kux_apply
+	return $rc
+}
+_kux_exit() {
+	[[ "${KUX_PID-}" == "$$" ]] || return 0
+	case "${KUX_STATE-}" in
+		*/kux/shells/*) command rm -rf "$KUX_STATE" ;;
+	esac
+}
+kux_prompt() {
+	printf '%s' "${_KUX_PROMPT-}"
+}
+_kux_status() {
+	_KUX_PROMPT=""
+	[[ -n "${KUX_STATE-}" ]] || return 0
+	local o="$KUX_STATE/overlay.yaml" p="$KUX_STATE/prompt" rest f
+	if [[ ! -f "$o" ]]; then
+		_KUX_PROMPT="☸ ?"
+		return 0
+	fi
+	if [[ ! -f "$p" || "$o" -nt "$p" ]]; then
+		"$_KUX_BIN" _prompt 2>/dev/null
+	fi
+	[[ -f "$p" ]] && IFS= read -r _KUX_PROMPT <"$p"
+	if [[ -n "${KUX_CLUSTER_FILE-}" ]]; then
+		if [[ ! -f "$KUX_CLUSTER_FILE" ]]; then
+			_KUX_PROMPT="$_KUX_PROMPT !stale"
+		else
+			rest="${KUX_ORIG_KUBECONFIG-}:"
+			while [[ -n "$rest" ]]; do
+				f="${rest%%:*}"
+				rest="${rest#*:}"
+				if [[ -n "$f" && "$f" -nt "$KUX_CLUSTER_FILE" ]]; then
+					_KUX_PROMPT="$_KUX_PROMPT !stale"
+					break
+				fi
+			done
+		fi
+	fi
+	[[ "${KUBECONFIG-}" == "${_KUX_KUBECONFIG-}" ]] || _KUX_PROMPT="$_KUX_PROMPT !edited"
+	return 0
+}
+EOF
+	if [ "$sh" = zsh ]; then
+		cat <<'EOF'
+_kux_precmd() {
+	_kux_status
+	[[ -n "$_KUX_NO_PROMPT" ]] && return 0
+	[[ "${RPROMPT-}" == "${_KUX_LAST_RPROMPT-}" ]] || _KUX_RPROMPT_BASE="${RPROMPT-}"
+	RPROMPT="${_KUX_PROMPT}${_KUX_PROMPT:+${_KUX_RPROMPT_BASE:+ }}${_KUX_RPROMPT_BASE-}"
+	_KUX_LAST_RPROMPT="$RPROMPT"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _kux_precmd
+add-zsh-hook zshexit _kux_exit
+EOF
+	else
+		cat <<'EOF'
+_kux_precmd() {
+	_kux_status
+	[[ -n "$_KUX_NO_PROMPT" ]] && return 0
+	[[ "${PS1-}" == "${_KUX_LAST_PS1-}" ]] || _KUX_PS1_BASE="${PS1-}"
+	PS1="${_KUX_PROMPT:+[$_KUX_PROMPT] }${_KUX_PS1_BASE-}"
+	_KUX_LAST_PS1="$PS1"
+}
+case "${PROMPT_COMMAND-}" in
+	*_kux_precmd*) ;;
+	*) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND
+}_kux_precmd" ;;
+esac
+[[ -n "$(trap -p EXIT)" ]] || trap _kux_exit EXIT
+EOF
+	fi
+	cat <<'EOF'
+eval "$("$_KUX_BIN" _start $$)"
+_kux_apply
+EOF
+}
+
+projection_path() {
+	printf '%s/%s.yaml' "$(clusters_dir)" "$1"
+}
+
+# True if any file of the original KUBECONFIG list is newer than projection $1.
+projection_stale() {
+	local rest f
+	rest="$(orig_kubeconfig):"
+	[ -f "$1" ] || return 0
+	while [ -n "$rest" ]; do
+		f="${rest%%:*}"
+		rest="${rest#*:}"
+		[ -n "$f" ] && [ "$f" -nt "$1" ] && return 0
+	done
+	return 1
+}
+
+# Make sure ~/.kube/clusters/<alias>.yaml is a fresh single-context projection of $2.
+# AIDEV-NOTE: projection must run against the ORIGINAL kubeconfig: with the overlay first in
+# KUBECONFIG, --minify would minify the overlay instead (DESIGN §3.5).
+ensure_projection() {
+	local alias="$1" real="$2" force="${3:-}" p dir
+	p="$(projection_path "$alias")"
+	if [ -z "$force" ] && ! projection_stale "$p" \
+		&& [ "$(table_cc "$(kc_table "$p")")" = "$real" ]; then
+		return
+	fi
+	dir="$(clusters_dir)"
+	mkdir -p "$dir" && chmod 700 "$dir"
+	(
+		umask 077
+		kc_orig config view --raw --minify --flatten --context="$real" >"$p.tmp.$$"
+	) || {
+		rm -f "$p.tmp.$$"
+		die "could not extract context $real"
+	}
+	mv -f "$p.tmp.$$" "$p"
+}
+
+# Current context as recorded in this shell's overlay.
+overlay_ctx() {
+	table_cc "$(kc_table "$KUX_STATE/overlay.yaml")"
+}
+
+overlay_ns() {
+	local t cc
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	[ -n "$cc" ] && table_ctx "$t" "$cc" | cut -f3
+}
+
+# Pin this shell to real context $2 (alias $1).
+pin_context() {
+	local alias="$1" real="$2" p info ns cur
+	cur="$(overlay_ctx)"
+	ensure_projection "$alias" "$real"
+	p="$(projection_path "$alias")"
+	info="$(table_ctx "$(kc_table "$p")" "$real")"
+	[ -n "$info" ] || die "context $real not found in $p"
+	if [ -n "$cur" ] && [ "$cur" != "$real" ]; then
+		remember_ns "$cur"
+		printf '%s\n' "$cur" >"$KUX_STATE/prev_ctx"
+	fi
+	ns="$(printf '%s' "$info" | cut -f3)"
+	[ -f "$KUX_STATE/ns/$alias" ] && ns="$(cat "$KUX_STATE/ns/$alias")"
+	write_overlay "$real" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" "$ns"
+	printf '%s\n' "$p" >"$KUX_STATE/cluster_file"
+	emit_kubeconfig "$KUX_STATE/overlay.yaml:$p"
+	emit_env "export KUX_CLUSTER_FILE=$(shq "$p")"
+	write_prompt
+}
+
+# Save the overlay's namespace for context $1 so switching back restores it.
+remember_ns() {
+	local a ns
+	a="$(alias_of "$1")"
+	[ -n "$a" ] || return 0
+	ns="$(overlay_ns)"
+	mkdir -p "$KUX_STATE/ns"
+	if [ -n "$ns" ]; then
+		printf '%s\n' "$ns" >"$KUX_STATE/ns/$a"
+	else
+		rm -f "$KUX_STATE/ns/$a"
+	fi
+}
+
+# Picker only when a human is looking; pipes get plain lists (KUX_FORCE_TTY is for tests).
+is_tty() {
+	[ -n "${KUX_FORCE_TTY:-}" ] || [ -t 1 ]
+}
+
+# pick PROMPT HEADER [fzf args...] < lines  ->  chosen line (first tab field shown first).
+# fzf when installed (and KUX_NO_FZF unset), else a numbered bash `select` menu on stderr.
+pick() {
+	local prompt="$1" header="$2" line choice
+	shift 2
+	if [ -z "${KUX_NO_FZF:-}" ] && command -v fzf >/dev/null 2>&1; then
+		fzf --height=40% --reverse --no-multi --prompt="$prompt> " --header="$header" \
+			--delimiter='\t' "$@"
+		return
+	fi
+	local items=()
+	while IFS= read -r line; do
+		[ -n "$line" ] && items+=("$line")
+	done
+	[ ${#items[@]} -gt 0 ] || return 1
+	printf '%s\n' "$header" >&2
+	PS3="$prompt> "
+	select choice in "${items[@]}"; do
+		if [ -n "$choice" ]; then
+			printf '%s\n' "$choice"
+			return 0
+		fi
+		printf 'kux: pick a number from the list\n' >&2
+	done <"${KUX_TTY:-/dev/tty}"
+	return 1
+}
+
+cache_dir() {
+	printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/kux/ns"
+}
+
+# Context the shell is actually on: the overlay when in a kux shell, else kubectl's view.
+current_ctx() {
+	if [ -n "${KUX_STATE:-}" ] && [ -f "$KUX_STATE/overlay.yaml" ]; then
+		overlay_ctx
+	else
+		kubectl config current-context 2>/dev/null
+	fi
+}
+
+# Namespaces of the current cluster, cached per real context for KUX_NS_TTL seconds.
+# Cache file: first line is the fetch epoch, then one namespace per line.
+list_namespaces() {
+	local refresh="${1:-}" ctx f out fetched
+	ctx="$(current_ctx)"
+	[ -n "$ctx" ] || die "no current context"
+	f="$(cache_dir)/$(printf '%s' "$ctx" | cksum | cut -d' ' -f1)"
+	if [ -z "$refresh" ] && [ -f "$f" ]; then
+		read -r fetched <"$f"
+		if [ $(($(date +%s) - ${fetched:-0})) -lt "${KUX_NS_TTL:-300}" ]; then
+			tail -n +2 "$f"
+			return
+		fi
+	fi
+	if out="$(kubectl get namespaces -o name --request-timeout=5s 2>/dev/null)"; then
+		mkdir -p "$(cache_dir)"
+		{
+			date +%s
+			printf '%s\n' "$out" | sed 's|^namespace/||'
+		} | write_file "$f"
+		tail -n +2 "$f"
+	elif [ -f "$f" ]; then
+		printf 'kux: cannot reach %s; showing cached namespaces\n' "$ctx" >&2
+		tail -n +2 "$f"
+	else
+		die "cannot list namespaces for $ctx (cluster unreachable?)"
+	fi
+}
+
+# Set this shell's namespace. The stanza comes from the merged view so an overlay whose
+# current-context was changed externally (no stanza of its own yet) is repaired, not broken.
+set_namespace() {
+	local ns="$1" ctx info a old
+	ctx="$(overlay_ctx)"
+	[ -n "$ctx" ] || die "no current context"
+	info="$(table_ctx "$(kc_table "$KUBECONFIG")" "$ctx")"
+	[ -n "$info" ] || die "context $ctx not found"
+	old="$(printf '%s' "$info" | cut -f3)"
+	write_overlay "$ctx" "$(printf '%s' "$info" | cut -f1)" "$(printf '%s' "$info" | cut -f2)" "$ns"
+	a="$(alias_of "$ctx")"
+	if [ -n "$a" ]; then
+		mkdir -p "$KUX_STATE/ns" "$KUX_STATE/prevns"
+		printf '%s\n' "$ns" >"$KUX_STATE/ns/$a"
+		[ "$old" != "$ns" ] && printf '%s\n' "${old:-default}" >"$KUX_STATE/prevns/$a"
+	fi
+	write_prompt
+	printf 'kux: namespace %s\n' "$ns" >&2
+}
+
+cmd_ns() {
+	local want a
+	case "${1:-}" in
+		"" | -r | --refresh)
+			if ! is_tty; then
+				list_namespaces "${1:-}"
+				return
+			fi
+			require_shell
+			load_aliases
+			want="$(list_namespaces "${1:-}" \
+				| pick ns "$(current_ctx | sed 's|.*/||') · ctrl-r refresh" \
+					--bind "ctrl-r:reload($(shq "$(self_path)") _nslist --refresh)")" \
+				|| exit 1
+			set_namespace "$want"
+			return
+			;;
+	esac
+	want="$1"
+	require_shell
+	load_aliases
+	if [ "$want" = "-" ]; then
+		a="$(alias_of "$(overlay_ctx)")"
+		[ -n "$a" ] && [ -s "$KUX_STATE/prevns/$a" ] || die "no previous namespace for this context"
+		want="$(cat "$KUX_STATE/prevns/$a")"
+	fi
+	set_namespace "$want"
+}
+
+first_orig_file() {
+	local o
+	o="$(orig_kubeconfig)"
+	printf '%s' "${o%%:*}"
+}
+
+json_str() {
+	printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+# Markers as in the prompt (DESIGN §6), computed here with forks allowed.
+status_markers() {
+	local cf expected
+	if [ ! -f "$KUX_STATE/overlay.yaml" ]; then
+		echo "?"
+		return
+	fi
+	[ -n "$(overlay_foreign)" ] && echo "!promote"
+	if [ -s "$KUX_STATE/cluster_file" ]; then
+		cf="$(cat "$KUX_STATE/cluster_file")"
+		projection_stale "$cf" && echo "!stale"
+		expected="$KUX_STATE/overlay.yaml:$cf"
+	else
+		expected="$KUX_STATE/overlay.yaml:$(orig_kubeconfig)"
+	fi
+	[ "${KUBECONFIG:-}" = "$expected" ] || echo "!edited"
+}
+
+cmd_status() {
+	local json="" ctx="" ns="" a="" cf="" markers="" pinned=false m
+	[ "${1:-}" = "--json" ] && json=1
+	if [ -z "${KUX_STATE:-}" ]; then
+		ctx="$(kubectl config current-context 2>/dev/null)"
+		if [ -n "$json" ]; then
+			printf '{"shell":false,"context":%s}\n' "$(json_str "$ctx")"
+		else
+			printf 'kux shell integration not loaded (context: %s)\n' "${ctx:-none}"
+		fi
+		return
+	fi
+	[ -f "$KUX_STATE/overlay.yaml" ] || heal_state >&2
+	if [ -f "$KUX_STATE/overlay.yaml" ]; then
+		ctx="$(overlay_ctx)"
+		ns="$(overlay_ns)"
+		a="$(alias_of "$ctx")"
+	fi
+	if [ -s "$KUX_STATE/cluster_file" ]; then
+		cf="$(cat "$KUX_STATE/cluster_file")"
+		pinned=true
+	fi
+	markers="$(status_markers)"
+	if [ -n "$json" ]; then
+		printf '{"shell":true,"id":%s,"context":%s,"alias":%s,"namespace":%s,' \
+			"$(json_str "${KUX_ID:-}")" "$(json_str "$ctx")" "$(json_str "$a")" \
+			"$(json_str "${ns:-default}")"
+		printf '"pinned":%s,"cluster_file":%s,"kubeconfig":%s,"markers":[' \
+			"$pinned" "$(json_str "$cf")" "$(json_str "${KUBECONFIG:-}")"
+		local sep=""
+		for m in $markers; do
+			printf '%s%s' "$sep" "$(json_str "$m")"
+			sep=","
+		done
+		printf ']}\n'
+		return
+	fi
+	printf 'context:   %s' "${a:-$ctx}"
+	[ -n "$a" ] && [ "$a" != "$ctx" ] && printf ' (%s)' "$ctx"
+	printf '\nnamespace: %s\n' "${ns:-default}"
+	if [ "$pinned" = true ]; then
+		printf 'mode:      pinned (%s)\n' "$cf"
+	else
+		printf 'mode:      unpinned (all contexts visible)\n'
+	fi
+	for m in $markers; do
+		case "$m" in
+			"?") echo "warning:   overlay missing; the next kux command recreates it" ;;
+			"!promote") echo "warning:   clusters/users were written into the overlay; run: kux promote" ;;
+			"!stale") echo "warning:   kubeconfig changed since the cluster file was made; run: kux refresh" ;;
+			"!edited") echo "warning:   KUBECONFIG was changed by hand; kux ctx/unset will reset it" ;;
+		esac
+	done
+}
+
+cmd_unset() {
+	local cur
+	require_shell
+	cur="$(overlay_ctx)"
+	[ -n "$cur" ] && printf '%s\n' "$cur" >"$KUX_STATE/prev_ctx"
+	write_unpinned_overlay
+	emit_unpinned
+	write_prompt
+	printf 'kux: unpinned (context %s)\n' "$(overlay_ctx)" >&2
+}
+
+drop_ns_cache() {
+	rm -f "$(cache_dir)/$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+}
+
+cmd_refresh() {
+	local real a
+	require_shell
+	load_aliases
+	real="$(overlay_ctx)"
+	[ -n "$real" ] && drop_ns_cache "$real"
+	if [ ! -s "$KUX_STATE/cluster_file" ]; then
+		write_prompt
+		printf 'kux: unpinned; namespace cache cleared\n' >&2
+		return
+	fi
+	a="$(alias_of "$real")"
+	[ -n "$a" ] || die "context $real is no longer in $(orig_kubeconfig); run: kux unset"
+	remember_ns "$real"
+	ensure_projection "$a" "$real" force
+	pin_context "$a" "$real"
+	printf 'kux: refreshed %s\n' "$a" >&2
+}
+
+# Move clusters/users/contexts another tool wrote into the overlay into the real kubeconfig.
+# AIDEV-NOTE: the real file is rewritten by kubectl (comments/order lost) — backup first. The real
+# file comes FIRST in the merge so its existing entries always win.
+cmd_promote() {
+	local target t cc info cf pc
+	require_shell
+	if [ -z "$(overlay_foreign)" ]; then
+		echo "kux: nothing to promote"
+		return
+	fi
+	target="$(first_orig_file)"
+	[ -f "$target" ] && cp -p "$target" "$target.kux-bak"
+	(
+		umask 077
+		KUBECONFIG="$target:$KUX_STATE/overlay.yaml" kubectl config view --raw >"$target.tmp.$$"
+	) || {
+		rm -f "$target.tmp.$$"
+		die "could not merge into $target"
+	}
+	mv -f "$target.tmp.$$" "$target"
+	t="$(kc_table "$KUX_STATE/overlay.yaml")"
+	cc="$(table_cc "$t")"
+	info="$(table_ctx "$t" "$cc")"
+	cf=""
+	[ -s "$KUX_STATE/cluster_file" ] && cf="$(cat "$KUX_STATE/cluster_file")"
+	if [ -n "$cf" ]; then
+		pc="$(table_cc "$(kc_table "$cf")")"
+		if [ "$pc" != "$cc" ]; then
+			cc="$pc"
+			info="$(table_ctx "$t" "$cc")"
+			[ -n "$info" ] || info="$(table_ctx "$(kc_table "$cf")" "$cc")"
+		fi
+	fi
+	KUX_CLOBBER=1 write_overlay "$cc" "$(printf '%s' "$info" | cut -f1)" \
+		"$(printf '%s' "$info" | cut -f2)" "$(printf '%s' "$info" | cut -f3)"
+	write_prompt
+	printf 'kux: promoted into %s (backup: %s.kux-bak)\n' "$target" "$target"
+}
+
+cmd_ctx() {
+	local want hit
+	if [ $# -eq 0 ] && ! is_tty; then
+		alias_table | cut -f1
+		return
+	fi
+	require_shell
+	load_aliases
+	if [ $# -eq 0 ]; then
+		hit="$(alias_table | pick ctx "current: $(alias_of "$(overlay_ctx)")" --with-nth=1,2)" \
+			|| exit 1
+		pin_context "${hit%%	*}" "${hit#*	}"
+		printf 'kux: context %s\n' "${hit%%	*}" >&2
+		return
+	fi
+	want="$1"
+	if [ "$want" = "-" ]; then
+		[ -s "$KUX_STATE/prev_ctx" ] || die "no previous context in this shell"
+		want="$(cat "$KUX_STATE/prev_ctx")"
+	fi
+	hit="$(resolve_context "$want")" || exit 1
+	pin_context "${hit%%	*}" "${hit#*	}"
+	printf 'kux: context %s\n' "${hit%%	*}" >&2
+}
+
 main() {
 	local cmd="${1:-status}"
 	[ $# -gt 0 ] && shift
 	case "$cmd" in
 		-h | --help | help) usage ;;
 		-v | --version | version) printf 'kux %s\n' "$KUX_VERSION" ;;
+		status) cmd_status "$@" ;;
+		ctx) cmd_ctx "$@" ;;
+		unset) cmd_unset ;;
+		refresh) cmd_refresh ;;
+		promote) cmd_promote ;;
+		gc) cmd_gc ;;
+		ns) cmd_ns "$@" ;;
+		_nslist) list_namespaces "${1:-}" ;;
+		_prompt) cmd_prompt_refresh ;;
+		init) cmd_init "$@" ;;
+		_start) cmd_start "${1:?pid}" ;;
+		_require_shell) require_shell ;;
+		_aliases) alias_table ;;
+		_resolve) resolve_context "$1" ;;
 		*)
 			usage >&2
 			die "unknown command: $cmd"

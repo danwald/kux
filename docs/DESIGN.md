@@ -31,7 +31,7 @@ deliberately.
 | `~/.kube/config` (or the original `KUBECONFIG` list) | Source of truth, managed by your tooling |
 | `~/.kube/clusters/<alias>.yaml` | Projection: single-context file, `0600`, via `kubectl config view --raw --minify --flatten` |
 | `$XDG_STATE_HOME/kux/shells/<id>/` | Per-shell state (see below) |
-| `$XDG_CACHE_HOME/kux/ns/<cksum>` | Namespace list per real context name, TTL 300 s, shared |
+| `$XDG_CACHE_HOME/kux/ns/<cksum>` | Namespace list per real context name (first line: fetch epoch), TTL `KUX_NS_TTL` = 300 s, shared |
 
 Per-shell state directory:
 
@@ -85,6 +85,9 @@ state is recomputed from it, so re-running init is idempotent.
 | `kux --version` | Version |
 | `kux gc` (hidden) | Sweep dead shells' state |
 
+`status --json` prints one object: `shell` (bool) and `context`; inside a shell also `id`,
+`alias`, `namespace`, `pinned`, `cluster_file`, `kubeconfig`, and `markers` (e.g. `["!stale"]`).
+
 Name resolution: exact real name → exact alias → unique substring of an alias → error listing the
 candidates. Ambiguity is never resolved silently.
 
@@ -101,7 +104,8 @@ Collisions are computed over the whole list every time. If a disambiguated alias
 
 ## 6. Prompt
 
-zsh prepends to `RPROMPT`, bash prepends to `PS1`, both idempotent; `--no-prompt` skips that and
+zsh prepends to `RPROMPT`, bash prepends `[…] ` to `PS1`, both idempotent (a prompt changed by
+another tool becomes the new base); `--no-prompt` skips that and
 leaves `$_KUX_PROMPT` for manual placement. Steady state costs **no process**: the hook reads
 `prompt` with the `read` builtin and runs only `test`-style checks.
 
@@ -115,6 +119,9 @@ Text: `☸ <alias>:<namespace>` (namespace `default` when unset), followed by ma
 | `!edited` | `KUBECONFIG` was changed by hand; kux leaves it alone | `kux ctx …` / `kux unset` |
 
 The hook forks `kux _prompt` only when the overlay is newer than `prompt` (an external write).
+That refresh also repairs a `current-context` left without a stanza by an external `use-context`.
+While `!promote` is showing, kux refuses to rewrite the overlay so nothing is lost.
+`\ $ ` %` in names are replaced with `_` in the prompt text so it is inert in both shells.
 
 ## 7. Lifetime
 
