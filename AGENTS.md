@@ -18,7 +18,6 @@ the spec and records the kubectl behaviours the code depends on (§3).
 make check      # shellcheck + shfmt -d + bats
 make fmt        # shfmt -w (tabs, per .editorconfig)
 make install    # symlink into ~/.local/bin
-make bump BUMP=minor
 ```
 
 ## 3. Rules #shell #compat
