@@ -14,6 +14,15 @@ echo 'eval "$(kux init zsh)"' >> ~/.zshrc   # or: eval "$(kux init bash)" in ~/.
 
 Requires `kubectl`. Uses `fzf` for the picker when installed.
 
+To uninstall, remove the `kux init` line from your rc file, then:
+
+```bash
+make -C ~/src/kux uninstall          # removes ~/.local/bin/kux and ~/.local/state/kux
+```
+
+Removing the state matters: nothing sweeps it once kux is gone, and anything that looks up a
+shell's state by pid (e.g. the tmux status line below) could match a stale entry.
+
 ## Usage
 
 ```bash
@@ -51,6 +60,20 @@ Markers after it are problems, and each one says how to fix it:
 To place it yourself, use `eval "$(kux init zsh --no-prompt)"` and put `$(kux_prompt)` (or
 `$_KUX_PROMPT`, updated before each prompt) where you want it, e.g. in a starship `custom`
 module or `PROMPT='…$(kux_prompt)…'` with `setopt prompt_subst`.
+
+### tmux status line
+
+tmux runs status-line commands outside your shells, so tools like
+[kube-tmux](https://github.com/jonmosco/kube-tmux) see the global context. Point them at the
+focused pane's kux state via `#{pane_pid}` instead:
+
+```
+#(d=$(ls -d $HOME/.local/state/kux/shells/#{pane_pid}-* 2>/dev/null | head -1); KUBECONFIG=${d:+$d/overlay.yaml:}${KUBECONFIG:-$HOME/.kube/config} $TMUX_PLUGIN_MANAGER_PATH/kube-tmux/kube.tmux)
+```
+
+Keep it on one line. Panes without kux fall back to the normal `KUBECONFIG`. It shows the real
+context name, updates every `status-interval`, and follows the pane's first shell (not nested
+ones). It assumes shells start with `~/.kube/config`.
 
 ### Environment
 

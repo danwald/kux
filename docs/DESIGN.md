@@ -12,7 +12,7 @@ deliberately.
 |---|---|
 | Per-shell ctx + ns, zsh and bash | Fan-out across clusters, `kux exec` |
 | Built-in prompt segment | Prod guardrails / styling |
-| Picker (`fzf`, `select` fallback) | tmux status line, inherit-on-split |
+| Picker (`fzf`, `select` fallback) | built-in tmux status line (README has a kube-tmux recipe), inherit-on-split |
 | Derived aliases, no config file | fish, nushell |
 | `git clone` + symlink install | CI, Homebrew, release tarballs |
 
