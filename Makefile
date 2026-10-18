@@ -2,9 +2,8 @@
 
 SHELL_FILES := bin/kux test/helpers.bash
 PREFIX ?= $(HOME)/.local
-BUMP ?= patch
 
-.PHONY: help lint fmt test check install uninstall bump
+.PHONY: help lint fmt test check install uninstall
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -29,12 +28,3 @@ install: ## Symlink bin/kux into $(PREFIX)/bin
 
 uninstall: ## Remove the symlink
 	rm -f $(PREFIX)/bin/kux
-
-bump: ## Bump KUX_VERSION (BUMP=major|minor|patch)
-	@v=$$(sed -n 's/^KUX_VERSION="\(.*\)"$$/\1/p' bin/kux); \
-	new=$$(echo "$$v" | awk -F. -v b=$(BUMP) '{ \
-		if (b=="major") print $$1+1".0.0"; \
-		else if (b=="minor") print $$1"."$$2+1".0"; \
-		else print $$1"."$$2"."$$3+1 }'); \
-	sed -i '' "s/^KUX_VERSION=\".*\"$$/KUX_VERSION=\"$$new\"/" bin/kux; \
-	echo "$$v -> $$new"
