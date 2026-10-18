@@ -26,5 +26,6 @@ install: ## Symlink bin/kux into $(PREFIX)/bin
 	ln -sf $(CURDIR)/bin/kux $(PREFIX)/bin/kux
 	@echo 'add to your rc file:  eval "$$(kux init zsh)"   # or bash'
 
-uninstall: ## Remove the symlink
+uninstall: ## Remove the symlink and per-shell state
 	rm -f $(PREFIX)/bin/kux
+	rm -rf "$${XDG_STATE_HOME:-$$HOME/.local/state}/kux"
