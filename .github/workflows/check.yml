@@ -1,0 +1,23 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # AIDEV-NOTE: macOS on purpose — kux and its tests rely on /bin/bash 3.2 and BSD sed/stat/touch.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install bats-core shellcheck shfmt kubernetes-cli
+      - name: Tool versions
+        run: |
+          /bin/bash --version | head -1
+          zsh --version
+          bats --version
+          kubectl version --client
+      - name: Lint and test
+        run: make check
